@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
@@ -11,10 +10,10 @@ class InstrumentConfig:
     databento_dataset: str
     databento_symbol: str
     databento_venue: str
-    ibkr_symbol: str
-    ibkr_exchange: str
-    ibkr_instrument_env: str
-    ibkr_rollover_days_before_expiry: int
+    execution_symbol: str
+    execution_venue: str
+    execution_instrument_env: str
+    rollover_days_before_expiry: int
     tick_size: float
     point_value: float
 
@@ -63,31 +62,16 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
-class RiskConfig:
-    contracts: int
-    enable_auto_sizing: bool
-    sizing_r_multiple: float
-    min_contracts: int
-    max_contracts: int
-    es_margin_per_contract: float
-
-
-@dataclass(frozen=True)
 class RuntimeConfig:
     algo_name: str
     instrument: InstrumentConfig
     session: SessionConfig
     strategy: StrategyConfig
-    risk: RiskConfig
     databento: dict
-    ibkr: dict
-    control_file: Path
+    ninja: dict
 
 
 class StrategyProdV8Config:
-    def __init__(self, control_file: str | Path = "/app/control/v8_es.json") -> None:
-        self.control_file = Path(control_file)
-
     def build(self) -> RuntimeConfig:
         return RuntimeConfig(
             algo_name="V8_ES",
@@ -96,10 +80,10 @@ class StrategyProdV8Config:
                 databento_dataset="GLBX.MDP3",
                 databento_symbol="AUTO_FROM_EXECUTION",
                 databento_venue="GLBX",
-                ibkr_symbol="ES",
-                ibkr_exchange="CME",
-                ibkr_instrument_env="IBKR_ES_INSTRUMENT_ID",
-                ibkr_rollover_days_before_expiry=8,
+                execution_symbol="ES",
+                execution_venue="CME",
+                execution_instrument_env="ES_EXECUTION_INSTRUMENT_ID",
+                rollover_days_before_expiry=8,
                 tick_size=0.25,
                 point_value=50.0,
             ),
@@ -138,46 +122,21 @@ class StrategyProdV8Config:
                 protected_stop_trigger_ticks=12,
                 protected_stop_ticks=1,
             ),
-            risk=RiskConfig(
-                contracts=3,
-                enable_auto_sizing=False,
-                sizing_r_multiple=1.25,
-                min_contracts=1,
-                max_contracts=100,
-                es_margin_per_contract=500.0,
-            ),
             databento={
                 "client_id": "DATABENTO",
                 "trade_schema": "trades",
                 "quote_schema": "mbp-1",
                 "ignore_quote_tick_size_updates": True,
             },
-            ibkr={
-                "client_id": "IB",
-                "host": "host.docker.internal",
-                "host_env": "IBKR_HOST",
-                "paper_port": 4002,
-                "live_port": 4001,
-                "ibg_client_id": 11,
-                "ibg_client_id_env": "IBKR_CLIENT_ID",
-                "ibg_client_id_span": 20,
-                "client_id_registry": "/app/control/ibkr_client_ids.json",
-                "instance_id_env": "ALGO_INSTANCE_ID",
-                "mode_env": "ALGO_TRADING_MODE",
-                "account_env": "TWS_ACCOUNT",
-                "paper_account_env": "TWS_ACCOUNT_PAPER",
-                "live_account_env": "TWS_ACCOUNT_LIVE",
-                "trading_mode": "paper",
-                "auto_start_gateway": True,
-                "auto_start_gateway_env": "IBKR_AUTO_START_GATEWAY",
-                "gateway_read_only_api": False,
-                "gateway_timeout": 300,
-                "gateway_image_env": "IBKR_GATEWAY_IMAGE",
-                "gateway_image": "ghcr.io/gnzsnz/ib-gateway:stable",
+            ninja={
+                "signal_pub_bind": "tcp://*:5555",
+                "state_pull_bind": "tcp://*:5556",
+                "signal_ttl_ms": 2000,
+                "heartbeat_interval_sec": 2.0,
+                "connection_timeout_sec": 8.0,
             },
-            control_file=self.control_file,
         )
 
 
-def load_config(control_file: str | Path = "/app/control/v8_es.json") -> RuntimeConfig:
-    return StrategyProdV8Config(control_file=control_file).build()
+def load_config() -> RuntimeConfig:
+    return StrategyProdV8Config().build()

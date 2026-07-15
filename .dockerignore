@@ -17,6 +17,7 @@ logs/
 
 README.md
 docker-compose*.yml
+TheBridge.cs
 
 *.tar
 *.zip

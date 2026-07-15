@@ -1,9 +1,0 @@
-{
-  "allow_new_entries": true,
-  "contracts": 3,
-  "enable_auto_sizing": false,
-  "sizing_r_multiple": 1.25,
-  "max_contracts": 3,
-  "flatten_now": false,
-  "stop_after_flat": false
-}

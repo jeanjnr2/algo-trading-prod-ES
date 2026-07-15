@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from queue import SimpleQueue
 from typing import Any, Deque
 
 from bar_builder import TenSecondBarBuilder
 from config import RuntimeConfig
-from control import ControlState, ControlWatcher, load_control
 from instruments import ResolvedInstruments, resolve_instruments
+from bridge import NinjaBridge
 from v8_engine import Quote, Signal, TradePrint, V8Engine
 
 LOGGER = logging.getLogger("strategy")
@@ -21,28 +22,19 @@ except Exception:  # Allows static checks without Nautilus installed.
         pass
 
 try:
-    from nautilus_trader.model.enums import OrderSide, TimeInForce
-    from nautilus_trader.model.identifiers import ClientId, ClientOrderId
-    from nautilus_trader.model.objects import Price, Quantity
+    from nautilus_trader.model.identifiers import ClientId
 except Exception:
-    OrderSide = None  # type: ignore[assignment]
-    TimeInForce = None  # type: ignore[assignment]
     ClientId = None  # type: ignore[assignment]
-    ClientOrderId = None  # type: ignore[assignment]
-    Price = None  # type: ignore[assignment]
-    Quantity = None  # type: ignore[assignment]
-
-try:
-    from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
-except Exception:
-    IBOrderTags = None  # type: ignore[assignment]
 
 
 class StrategyProdV8Nautilus(Strategy):
-    """Nautilus wrapper around the pure V8 engine.
+    """Nautilus wrapper around the pure V8 signal engine.
 
-    The pure trading logic lives in `V8Engine`. This wrapper subscribes to
-    Databento ticks, applies JSON controls and sends IBKR orders.
+    This class does not execute orders. It only:
+    - consumes Databento trades and quotes,
+    - builds the same 10s bars/profile as the backtest,
+    - sends LONG/SHORT intentions to NinjaTrader through ZeroMQ,
+    - listens to Ninja state to avoid sending signals while a trade is active.
     """
 
     def __init__(
@@ -54,80 +46,54 @@ class StrategyProdV8Nautilus(Strategy):
         super().__init__()
         self.runtime_config = config
         self.instruments = instruments or resolve_instruments(config.instrument)
-        if instrument_id is not None:
-            self.data_instrument_id = instrument_id
-            self.exec_instrument_id = instrument_id
-        else:
-            self.data_instrument_id = self.instruments.data_instrument_id
-            self.exec_instrument_id = self.instruments.exec_instrument_id
+        self.data_instrument_id = instrument_id or self.instruments.data_instrument_id
         self.engine = V8Engine(config.strategy, config.instrument)
         self.data_client_id = self._client_id(config.databento["client_id"])
-        self.exec_client_id = self._client_id(config.ibkr["client_id"])
         self.bar_builder = TenSecondBarBuilder()
-        self.control_queue: SimpleQueue[ControlState] = SimpleQueue()
-        self.control = load_control(config.control_file)
-        self.control_watcher = ControlWatcher(config.control_file, self.control_queue)
+        self.ninja_event_queue: SimpleQueue[dict[str, Any]] = SimpleQueue()
+        self.bridge = NinjaBridge(config.ninja, self.ninja_event_queue)
         self.algo_state = "STARTING"
         self.in_position = False
-        self.entry_order_pending = False
-        self.exit_order_pending = False
-        self.protected_stop_moved = False
-        self.entry_price = 0.0
-        self.active_qty = 0
-        self.entry_requested_qty = 0
-        self.entry_filled_qty = 0
-        self.entry_fill_notional = 0.0
-        self.position_direction = 0
-        self.trade_sequence = 0
+        self.signal_pending = False
+        self.ninja_ready = False
+        self.current_signal_id = ""
         self.last_quote_bid_ask: tuple[float, float] | None = None
         self.quote_history: Deque[Quote] = deque(maxlen=10000)
-        self.entry_order_id: Any | None = None
-        self.tp_order_id: Any | None = None
-        self.sl_order_id: Any | None = None
-        self.tp_order: Any | None = None
-        self.sl_order: Any | None = None
-        self.current_order_ref = ""
         self.last_rollover_check_date: Any | None = None
         self.rollover_blocked = False
 
     def on_start(self) -> None:
         self._log_state("STARTING", "READY")
-        self.control_watcher.start()
+        self.bridge.start()
         self._subscribe_market_data()
         LOGGER.info(
-            "STRATEGY_STARTED | algo=%s | data_instrument=%s | exec_instrument=%s | exec_source=%s | expiry=%s | rollover=%s",
+            "STRATEGY_STARTED | algo=%s | data_instrument=%s | exec_owner=NINJA | exec_chart_instrument=NINJA_CHART | exec_source=%s | expiry=%s | rollover=%s",
             self.runtime_config.algo_name,
             self.data_instrument_id,
-            self.exec_instrument_id,
             self.instruments.exec_source,
             self.instruments.expiry_date or "manual",
             self.instruments.rollover_date or "manual",
         )
 
     def on_stop(self) -> None:
-        self.control_watcher.stop()
+        self.bridge.stop()
         self._log_state(self.algo_state, "STOPPED")
         LOGGER.info("STRATEGY_STOPPED | algo=%s", self.runtime_config.algo_name)
 
     def on_trade_tick(self, tick: Any) -> None:
-        self._process_controls()
+        self._process_events()
         trade = self._trade_from_tick(tick)
         if trade is None:
             return
 
         self._check_rollover_guard(trade.ts)
-        self._force_flat_due(trade.ts)
-        # Match the backtest: evaluate completed 10s bars at their close time
-        # before this new bucket's first trade enters the POC/NML profile.
-        completed_bars = self.bar_builder.flush_until(trade.ts)
-        for completed in completed_bars:
+        for completed in self.bar_builder.flush_until(trade.ts):
             self._on_completed_bar(completed)
-        completed_bars = self.bar_builder.on_trade(trade)
-        for completed in completed_bars:
+        for completed in self.bar_builder.on_trade(trade):
             self._on_completed_bar(completed)
 
     def on_quote_tick(self, tick: Any) -> None:
-        self._process_controls()
+        self._process_events()
         quote = self._quote_from_tick(tick)
         if quote is None:
             return
@@ -138,67 +104,83 @@ class StrategyProdV8Nautilus(Strategy):
         self.engine.on_quote(quote)
         for completed in self.bar_builder.flush_until(quote.ts):
             self._on_completed_bar(completed)
-        if self._force_flat_due(quote.ts):
-            return
-        self._try_move_stop_to_protected(quote)
 
     def _on_completed_bar(self, completed: Any) -> None:
-        self._process_controls()
+        self._process_events()
         bar = getattr(completed, "bar", completed)
         for profile_trade in getattr(completed, "profile_trades", []):
             self.engine.on_trade(profile_trade)
+
         quote = self._quote_at_or_before(bar.ts)
         if quote is None:
             return
         self.engine.on_quote(quote)
         signal = self.engine.on_bar(bar)
-        if self._force_flat_due(bar.ts):
+
+        if self.rollover_blocked:
             return
-        if not self.control.allow_new_entries:
+        if not self.ninja_ready:
             return
-        if self.in_position or self.entry_order_pending or self.exit_order_pending:
+        if self.in_position or self.signal_pending:
             return
         if not self._in_entry_window(bar.ts):
             return
-        if signal is None:
+        if self._force_flat_window(bar.ts):
             return
-        qty = self._order_quantity()
-        if qty <= 0:
-            LOGGER.warning("NO_TRADE | reason=quantity_zero")
+        if signal is None:
             return
 
         LOGGER.info(
-            "SIGNAL_ACCEPTED | side=%s | qty=%s | comp30=%.3f | exp6=%.3f | body_ticks=%.1f | poc_distance=%.1f | nml_share=%.4f",
+            "SIGNAL_ACCEPTED | side=%s | comp30=%.3f | exp6=%.3f | body_ticks=%.1f | poc_distance=%.1f | nml_share=%.4f",
             "LONG" if signal.direction == 1 else "SHORT",
-            qty,
             signal.comp30,
             signal.exp_range6,
             signal.body_ticks,
             signal.poc_distance_ticks,
             signal.nml_volume_share,
         )
-        self._submit_entry(signal, qty)
+        self._send_signal_to_ninja(signal)
 
-    def _process_controls(self) -> None:
-        while not self.control_queue.empty():
-            previous = self.control
-            self.control = self.control_queue.get()
-            LOGGER.info(
-                "CONTROL_CHANGED | allow_new_entries=%s | contracts=%s | auto_sizing=%s | r_multiple=%.2f | max_contracts=%s | flatten_now=%s | stop_after_flat=%s",
-                self.control.allow_new_entries,
-                self.control.contracts,
-                self.control.enable_auto_sizing,
-                self.control.sizing_r_multiple,
-                self.control.max_contracts,
-                self.control.flatten_now,
-                self.control.stop_after_flat,
-            )
-            if previous.allow_new_entries and not self.control.allow_new_entries:
-                self._log_state(self.algo_state, "PAUSED")
-            elif not previous.allow_new_entries and self.control.allow_new_entries:
+    def _process_events(self) -> None:
+        while not self.ninja_event_queue.empty():
+            self._process_ninja_event(self.ninja_event_queue.get())
+
+    def _process_ninja_event(self, event: dict[str, Any]) -> None:
+        event_type = str(event.get("type", "")).upper()
+        signal_id = str(event.get("signal_id", ""))
+        LOGGER.info("NINJA_EVENT | type=%s | signal_id=%s | payload=%s", event_type, signal_id, event)
+
+        if event_type in {"ACK", "SIGNAL_ACCEPTED"}:
+            self.signal_pending = False
+            return
+        if event_type in {"READY", "HEARTBEAT"}:
+            if not self.ninja_ready:
+                LOGGER.info("NINJA_LINK_READY | event_type=%s", event_type)
+                self._log_ninja_chart_context(event)
                 self._log_state(self.algo_state, "READY")
-            if self.control.flatten_now:
-                self._flatten_now()
+            self.ninja_ready = True
+            return
+        if event_type == "NINJA_CONNECTION_LOST":
+            self.ninja_ready = False
+            self._log_state(self.algo_state, "NINJA_CONNECTION_LOST")
+            return
+        if event_type in {"REJECTED", "SIGNAL_REJECTED"}:
+            LOGGER.warning(
+                "SIGNAL_REJECTED_BY_NINJA | signal_id=%s | reason=%s",
+                signal_id,
+                event.get("reason", ""),
+            )
+            self.signal_pending = False
+            self._log_state(self.algo_state, "READY")
+            return
+        if event_type in {"POSITION_OPEN", "SIGNALS_DISABLED"}:
+            self.signal_pending = False
+            self.in_position = True
+            self.current_signal_id = signal_id or self.current_signal_id
+            self._log_state(self.algo_state, "NINJA_POSITION_OPEN")
+            return
+        if event_type in {"POSITION_FLAT", "SIGNALS_ENABLED"}:
+            self._mark_flat(reason=event_type.lower())
 
     def _check_rollover_guard(self, ts: datetime) -> None:
         local_date = ts.astimezone(self.runtime_config.session.tzinfo).date()
@@ -215,249 +197,90 @@ class StrategyProdV8Nautilus(Strategy):
 
         if not self.rollover_blocked:
             LOGGER.error(
-                "ROLLOVER_RESTART_REQUIRED | current_execution=%s | new_execution=%s | current_data=%s | new_data=%s | action=pause_new_entries",
-                self.instruments.exec_symbol,
-                resolved.exec_symbol,
+                "ROLLOVER_RESTART_REQUIRED | current_data=%s | new_data=%s | current_front_month=%s | new_front_month=%s | action=pause_new_entries",
                 self.instruments.data_symbol,
                 resolved.data_symbol,
+                self.instruments.exec_symbol,
+                resolved.exec_symbol,
             )
         self.rollover_blocked = True
-        self.control = ControlState(
-            allow_new_entries=False,
-            contracts=self.control.contracts,
-            enable_auto_sizing=self.control.enable_auto_sizing,
-            sizing_r_multiple=self.control.sizing_r_multiple,
-            max_contracts=self.control.max_contracts,
-            flatten_now=False,
-            stop_after_flat=self.control.stop_after_flat,
-        )
+        self._log_state(self.algo_state, "ROLLOVER_BLOCKED")
 
-    def _submit_entry(self, signal: Signal, qty: int) -> None:
-        self.trade_sequence += 1
-        side_text = "BUY" if signal.direction == 1 else "SELL"
-        safe_algo = "".join(ch for ch in self.runtime_config.algo_name if ch.isalnum())[:10]
-        order_ref = f"{safe_algo}-{datetime.now(timezone.utc):%y%m%d%H%M%S}-{self.trade_sequence:03d}"
-        LOGGER.info("ORDER_SUBMIT_REQUEST | ref=%s | side=%s | qty=%s", order_ref, side_text, qty)
-
-        if OrderSide is None or TimeInForce is None or ClientOrderId is None or Quantity is None:
-            LOGGER.error("ORDER_SUBMIT_FAILED | ref=%s | reason=nautilus_order_types_unavailable", order_ref)
-            return
-
+    def _send_signal_to_ninja(self, signal: Signal) -> None:
+        side_text = "LONG" if signal.direction == 1 else "SHORT"
         try:
-            order_side = OrderSide.BUY if signal.direction == 1 else OrderSide.SELL
-            order = self.order_factory.market(  # type: ignore[attr-defined]
-                instrument_id=self.exec_instrument_id,
-                order_side=order_side,
-                quantity=Quantity.from_int(qty),
-                time_in_force=TimeInForce.DAY,
-                tags=[f"algo={self.runtime_config.algo_name}", f"ref={order_ref}", "leg=entry"],
-                client_order_id=ClientOrderId(f"{order_ref}-ENTRY"),
-            )
-            self.submit_order(order, client_id=self.exec_client_id)  # type: ignore[attr-defined]
+            ninja_signal = self.bridge.send_signal(self.runtime_config.algo_name, side_text)
         except Exception as exc:
-            LOGGER.exception("ORDER_SUBMIT_FAILED | ref=%s | error=%s", order_ref, exc)
+            LOGGER.exception("SIGNAL_SEND_FAILED | side=%s | error=%s", side_text, exc)
             return
 
-        self.entry_order_pending = True
-        self.current_order_ref = order_ref
-        self.position_direction = signal.direction
-        self.active_qty = qty
-        self.entry_requested_qty = qty
-        self.entry_filled_qty = 0
-        self.entry_fill_notional = 0.0
-        self.entry_order_id = getattr(order, "client_order_id", None)
-        self._log_state(self.algo_state, "ENTRY_PENDING")
+        self.signal_pending = True
+        self.current_signal_id = ninja_signal.signal_id
+        self._log_state(self.algo_state, "SIGNAL_PENDING")
 
-    def on_order_filled(self, event: Any) -> None:
-        client_order_id = self._event_client_order_id(event)
-        fill_price = self._event_price(event)
-        fill_qty = self._event_qty(event)
+    def _mark_flat(self, reason: str) -> None:
+        LOGGER.info("POSITION_FLAT | reason=%s | signal_id=%s", reason, self.current_signal_id)
+        self.in_position = False
+        self.signal_pending = False
+        self.current_signal_id = ""
+        self._log_state(self.algo_state, "READY")
+
+    def _log_ninja_chart_context(self, event: dict[str, Any]) -> None:
+        chart_instrument = str(event.get("chart_instrument", ""))
+        master_instrument = str(event.get("master_instrument", ""))
+        account = str(event.get("account", ""))
+        expected_hints = self._expected_ninja_contract_hints()
+        expected_display = "|".join(expected_hints)
+
         LOGGER.info(
-            "ORDER_FILLED | order_id=%s | price=%s | qty=%s",
-            client_order_id,
-            f"{fill_price:.2f}" if fill_price is not None else "unknown",
-            fill_qty if fill_qty is not None else "unknown",
+            "NINJA_CHART_CONTEXT | chart_instrument=%s | master_instrument=%s | account=%s | python_data_contract=%s | expected_ninja_hint=%s",
+            chart_instrument or "unknown",
+            master_instrument or "unknown",
+            account or "unknown",
+            self.instruments.data_symbol,
+            expected_display or "unknown",
         )
 
-        if client_order_id and client_order_id.endswith("-ENTRY"):
-            if fill_price is None or fill_qty is None:
-                LOGGER.error(
-                    "ENTRY_FILL_IGNORED | reason=missing_fill_data | order_id=%s | price=%s | qty=%s",
-                    client_order_id,
-                    fill_price,
-                    fill_qty,
-                )
-                return
-            fill_qty = max(1, int(fill_qty))
-            self.entry_filled_qty += fill_qty
-            self.entry_fill_notional += fill_price * fill_qty
-            self.entry_price = self.entry_fill_notional / self.entry_filled_qty
-            self.active_qty = self.entry_filled_qty
-            self.in_position = True
-
-            LOGGER.info(
-                "ENTRY_FILL_PROGRESS | order_id=%s | filled=%s/%s | avg_price=%.2f",
-                client_order_id,
-                self.entry_filled_qty,
-                self.entry_requested_qty,
-                self.entry_price,
+        chart_upper = chart_instrument.upper()
+        if expected_hints and chart_instrument and not any(hint in chart_upper for hint in expected_hints):
+            LOGGER.warning(
+                "NINJA_CONTRACT_CHECK_UNCERTAIN | chart_instrument=%s | python_data_contract=%s | expected_ninja_hint=%s | action=verify_chart_contract",
+                chart_instrument,
+                self.instruments.data_symbol,
+                expected_display,
             )
-            if self.entry_filled_qty < self.entry_requested_qty:
-                self._log_state(self.algo_state, "ENTRY_PARTIAL")
-                return
 
-            self.entry_order_pending = False
-            self.protected_stop_moved = False
-            self._log_state(self.algo_state, "IN_POSITION")
-            self._submit_bracket_from_entry()
-            return
+    def _expected_ninja_contract_hints(self) -> list[str]:
+        data_root = self.instruments.data_symbol.split(".", 1)[0].upper()
+        match = re.match(r"^([A-Z]+)([FGHJKMNQUVXZ])([0-9])$", data_root)
+        if not match:
+            return []
 
-        if client_order_id and (client_order_id.endswith("-TP") or client_order_id.endswith("-SL") or client_order_id.endswith("-FLAT")):
-            self._mark_flat(reason=client_order_id.rsplit("-", 1)[-1])
-
-    def on_order_rejected(self, event: Any) -> None:
-        self._handle_order_terminal_event("ORDER_REJECTED", event)
-
-    def on_order_denied(self, event: Any) -> None:
-        self._handle_order_terminal_event("ORDER_DENIED", event)
-
-    def on_order_canceled(self, event: Any) -> None:
-        self._handle_order_terminal_event("ORDER_CANCELED", event)
-
-    def on_position_closed(self, event: Any) -> None:
-        realized = getattr(event, "realized_pnl", None)
-        LOGGER.info("POSITION_CLOSED | realized_pnl=%s", realized)
-        self._mark_flat(reason="position_closed")
-
-    def _submit_bracket_from_entry(self) -> None:
-        if self.entry_price <= 0 or self.position_direction == 0:
-            return
-        tick = self.runtime_config.instrument.tick_size
-        tp = self.entry_price + self.position_direction * self.runtime_config.strategy.profit_target_ticks * tick
-        sl = self.entry_price - self.position_direction * self.runtime_config.strategy.stop_loss_ticks * tick
-        LOGGER.info("BRACKET_SUBMIT_REQUEST | ref=%s | tp=%.2f | sl=%.2f | oca_type=1", self.current_order_ref, tp, sl)
-
-        if OrderSide is None or TimeInForce is None or ClientOrderId is None or Price is None or Quantity is None:
-            LOGGER.error("BRACKET_SUBMIT_FAILED | reason=nautilus_order_types_unavailable")
-            self._flatten_now()
-            return
-
-        exit_side = OrderSide.SELL if self.position_direction == 1 else OrderSide.BUY
-        oca_tags = []
-        if IBOrderTags is not None:
-            oca_tags.append(
-                IBOrderTags(
-                    ocaGroup=f"{self.current_order_ref}-OCA",
-                    ocaType=1,
-                    outsideRth=True,
-                ).value
-            )
-        oca_tags.extend([f"algo={self.runtime_config.algo_name}", f"ref={self.current_order_ref}"])
-
-        try:
-            self.tp_order = self.order_factory.limit(  # type: ignore[attr-defined]
-                instrument_id=self.exec_instrument_id,
-                order_side=exit_side,
-                quantity=Quantity.from_int(self.active_qty),
-                price=self._price(tp),
-                time_in_force=TimeInForce.DAY,
-                reduce_only=True,
-                tags=[*oca_tags, "leg=tp"],
-                client_order_id=ClientOrderId(f"{self.current_order_ref}-TP"),
-            )
-            self.sl_order = self.order_factory.stop_market(  # type: ignore[attr-defined]
-                instrument_id=self.exec_instrument_id,
-                order_side=exit_side,
-                quantity=Quantity.from_int(self.active_qty),
-                trigger_price=self._price(sl),
-                time_in_force=TimeInForce.DAY,
-                reduce_only=True,
-                tags=[*oca_tags, "leg=sl"],
-                client_order_id=ClientOrderId(f"{self.current_order_ref}-SL"),
-            )
-            # Submit the protective stop first. IBKR/Nautilus order-list handling
-            # can leave one leg inflight; separate OCA submissions are easier to
-            # audit and keep the position protected as early as possible.
-            self.submit_order(self.sl_order, client_id=self.exec_client_id)  # type: ignore[attr-defined]
-            self.submit_order(self.tp_order, client_id=self.exec_client_id)  # type: ignore[attr-defined]
-        except Exception as exc:
-            LOGGER.exception("BRACKET_SUBMIT_FAILED | error=%s | action=flatten", exc)
-            self._flatten_now()
-            return
-
-        self.tp_order_id = getattr(self.tp_order, "client_order_id", None)
-        self.sl_order_id = getattr(self.sl_order, "client_order_id", None)
-        self.exit_order_pending = False
-        LOGGER.info("BRACKET_SUBMITTED | tp_order=%s | sl_order=%s", self.tp_order_id, self.sl_order_id)
-
-    def _try_move_stop_to_protected(self, quote: Quote) -> None:
-        if not self.in_position or self.entry_price <= 0 or self.protected_stop_moved or self.sl_order is None:
-            return
-        tick = self.runtime_config.instrument.tick_size
-        trigger = self.entry_price + self.position_direction * self.runtime_config.strategy.protected_stop_trigger_ticks * tick
-        market = quote.bid if self.position_direction == 1 else quote.ask
-        hit = market >= trigger if self.position_direction == 1 else market <= trigger
-        if not hit:
-            return
-        protected = self.entry_price + self.position_direction * self.runtime_config.strategy.protected_stop_ticks * tick
-        LOGGER.info("PROTECTED_STOP_REQUEST | new_stop=%.2f | trigger=%.2f", protected, trigger)
-        try:
-            self.modify_order(  # type: ignore[attr-defined]
-                self.sl_order,
-                trigger_price=self._price(protected),
-                client_id=self.exec_client_id,
-            )
-        except Exception as exc:
-            LOGGER.exception("PROTECTED_STOP_FAILED | error=%s", exc)
-            return
-        self.protected_stop_moved = True
-        LOGGER.info("PROTECTED_STOP_SUBMITTED | new_stop=%.2f", protected)
-
-    def _flatten_now(self) -> None:
-        if self.exit_order_pending:
-            LOGGER.info("FLATTEN_SKIPPED | reason=exit_already_pending")
-            return
-        LOGGER.warning("FLATTEN_REQUESTED | source=control_json")
-        try:
-            self.cancel_all_orders(self.exec_instrument_id, client_id=self.exec_client_id)  # type: ignore[attr-defined]
-        except Exception as exc:
-            LOGGER.warning("CANCEL_ALL_FAILED | error=%s", exc)
-        if not self.in_position and not self.entry_order_pending:
-            LOGGER.info("FLATTEN_SKIPPED | reason=already_flat_or_no_pending_entry")
-            return
-        try:
-            self.close_all_positions(  # type: ignore[attr-defined]
-                self.exec_instrument_id,
-                client_id=self.exec_client_id,
-                tags=[f"algo={self.runtime_config.algo_name}", f"ref={self.current_order_ref}", "leg=flat"],
-            )
-        except Exception as exc:
-            LOGGER.exception("FLATTEN_FAILED | error=%s", exc)
-            return
-        self.exit_order_pending = True
-        self._log_state(self.algo_state, "FLATTEN_PENDING")
-
-    def _force_flat_due(self, ts: datetime) -> bool:
-        local = ts.astimezone(self.runtime_config.session.tzinfo)
-        if local.time().isoformat() < self.runtime_config.session.force_flat_time:
-            return False
-        if self.in_position and not self.exit_order_pending:
-            LOGGER.warning("FORCE_FLAT_TIME | action=flatten")
-            self._flatten_now()
-        return True
-
-    def _in_entry_window(self, ts: datetime) -> bool:
-        local_time = ts.astimezone(self.runtime_config.session.tzinfo).time().isoformat()
-        return self.runtime_config.session.start_trading_time <= local_time <= self.runtime_config.session.last_entry_time
-
-    def _order_quantity(self) -> int:
-        max_contracts = min(self.runtime_config.risk.max_contracts, self.control.max_contracts)
-        contracts = self.control.contracts
-        if not self.control.enable_auto_sizing:
-            return max(self.runtime_config.risk.min_contracts, min(max_contracts, contracts))
-        # Account equity is intentionally not guessed here. Wire IBKR account values
-        # before enabling real auto-sizing.
-        return max(self.runtime_config.risk.min_contracts, min(max_contracts, contracts))
+        month_by_code = {
+            "F": ("01", "JAN"),
+            "G": ("02", "FEB"),
+            "H": ("03", "MAR"),
+            "J": ("04", "APR"),
+            "K": ("05", "MAY"),
+            "M": ("06", "JUN"),
+            "N": ("07", "JUL"),
+            "Q": ("08", "AUG"),
+            "U": ("09", "SEP"),
+            "V": ("10", "OCT"),
+            "X": ("11", "NOV"),
+            "Z": ("12", "DEC"),
+        }
+        month = month_by_code.get(match.group(2))
+        if month is None:
+            return []
+        month_number, month_name = month
+        root = match.group(1)
+        year = "202" + match.group(3)
+        return [
+            data_root,
+            f"{root} {month_number}-{year[-2:]}",
+            f"{root} {month_name}{year[-2:]}",
+        ]
 
     def _subscribe_market_data(self) -> None:
         if self.data_instrument_id is None:
@@ -469,6 +292,14 @@ class StrategyProdV8Nautilus(Strategy):
             LOGGER.info("MARKET_DATA_SUBSCRIBED | instrument=%s", self.data_instrument_id)
         except Exception as exc:
             LOGGER.error("MARKET_DATA_SUBSCRIBE_FAILED | error=%s", exc)
+
+    def _in_entry_window(self, ts: datetime) -> bool:
+        local_time = ts.astimezone(self.runtime_config.session.tzinfo).time().isoformat()
+        return self.runtime_config.session.start_trading_time <= local_time <= self.runtime_config.session.last_entry_time
+
+    def _force_flat_window(self, ts: datetime) -> bool:
+        local_time = ts.astimezone(self.runtime_config.session.tzinfo).time().isoformat()
+        return local_time >= self.runtime_config.session.force_flat_time
 
     def _log_state(self, old: str, new: str) -> None:
         if old == new:
@@ -491,122 +322,11 @@ class StrategyProdV8Nautilus(Strategy):
                 return quote
         return None
 
-    def _handle_order_terminal_event(self, event_name: str, event: Any) -> None:
-        client_order_id = self._event_client_order_id(event)
-        LOGGER.warning("%s | order_id=%s | event=%s", event_name, client_order_id, event)
-        if client_order_id and client_order_id.endswith("-ENTRY"):
-            if self.entry_filled_qty > 0:
-                LOGGER.warning(
-                    "%s_PARTIAL_ENTRY | order_id=%s | filled=%s/%s | action=protect_filled_qty",
-                    event_name,
-                    client_order_id,
-                    self.entry_filled_qty,
-                    self.entry_requested_qty,
-                )
-                self.entry_order_pending = False
-                self.in_position = True
-                self.entry_price = self.entry_fill_notional / self.entry_filled_qty
-                self.active_qty = self.entry_filled_qty
-                self.protected_stop_moved = False
-                self._log_state(self.algo_state, "IN_POSITION")
-                if self.exit_order_pending:
-                    LOGGER.warning(
-                        "%s_PARTIAL_ENTRY | order_id=%s | bracket_skipped=flatten_pending",
-                        event_name,
-                        client_order_id,
-                    )
-                    return
-                self._submit_bracket_from_entry()
-                return
-            self.entry_order_pending = False
-            self.position_direction = 0
-            self.active_qty = 0
-            self._reset_entry_fill_tracking()
-            self._log_state(self.algo_state, "READY")
-            return
-
-        if client_order_id and (client_order_id.endswith("-TP") or client_order_id.endswith("-SL")):
-            if event_name in {"ORDER_REJECTED", "ORDER_DENIED"} and self.in_position:
-                LOGGER.error(
-                    "%s_EXIT_ORDER | order_id=%s | action=flatten",
-                    event_name,
-                    client_order_id,
-                )
-                self._flatten_now()
-
-    def _reset_entry_fill_tracking(self) -> None:
-        self.entry_requested_qty = 0
-        self.entry_filled_qty = 0
-        self.entry_fill_notional = 0.0
-
-    def _mark_flat(self, reason: str) -> None:
-        LOGGER.info("POSITION_FLAT | reason=%s | ref=%s", reason, self.current_order_ref)
-        self.in_position = False
-        self.entry_order_pending = False
-        self.exit_order_pending = False
-        self.protected_stop_moved = False
-        self.entry_price = 0.0
-        self.active_qty = 0
-        self._reset_entry_fill_tracking()
-        self.position_direction = 0
-        self.entry_order_id = None
-        self.tp_order_id = None
-        self.sl_order_id = None
-        self.tp_order = None
-        self.sl_order = None
-        self.current_order_ref = ""
-        if self.control.stop_after_flat:
-            self.control = ControlState(
-                allow_new_entries=False,
-                contracts=self.control.contracts,
-                enable_auto_sizing=self.control.enable_auto_sizing,
-                sizing_r_multiple=self.control.sizing_r_multiple,
-                max_contracts=self.control.max_contracts,
-                flatten_now=False,
-                stop_after_flat=True,
-            )
-            self._log_state(self.algo_state, "PAUSED")
-        else:
-            self._log_state(self.algo_state, "READY")
-
     @staticmethod
     def _client_id(value: str) -> Any:
         if ClientId is None:
             return value
         return ClientId(value)
-
-    @staticmethod
-    def _event_client_order_id(event: Any) -> str:
-        value = getattr(event, "client_order_id", "") or getattr(event, "order_id", "")
-        return str(value)
-
-    @staticmethod
-    def _event_price(event: Any) -> float | None:
-        for field in ("avg_px", "last_px", "price"):
-            value = getattr(event, field, None)
-            if value is not None:
-                try:
-                    return float(value)
-                except Exception:
-                    continue
-        return None
-
-    @staticmethod
-    def _event_qty(event: Any) -> int | None:
-        for field in ("last_qty", "filled_qty", "quantity", "qty"):
-            value = getattr(event, field, None)
-            if value is not None:
-                try:
-                    return int(float(value))
-                except Exception:
-                    continue
-        return None
-
-    @staticmethod
-    def _price(value: float) -> Any:
-        if Price is None:
-            return value
-        return Price.from_str(f"{value:.2f}")
 
     @staticmethod
     def _trade_from_tick(tick: Any) -> TradePrint | None:
@@ -643,5 +363,7 @@ class StrategyProdV8Nautilus(Strategy):
         if isinstance(value, datetime):
             return value
         if isinstance(value, int):
+            from datetime import timezone
+
             return datetime.fromtimestamp(value / 1_000_000_000, tz=timezone.utc)
         raise ValueError(f"Unsupported event timestamp: {value!r}")

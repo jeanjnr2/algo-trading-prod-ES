@@ -2,10 +2,6 @@
 .env
 .env.*
 
-# Runtime control files
-control/ibkr_client_ids.json
-control/ibkr_client_ids.json.lock
-
 # Logs
 logs/
 *.log
@@ -18,11 +14,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tmp/
 
 # Local virtual environments
 .venv/
 venv/
 env/
+
+# Build outputs
+bin/
+obj/
 
 # Data, exports, and bulky generated outputs
 *.csv

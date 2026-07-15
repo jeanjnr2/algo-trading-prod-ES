@@ -33,14 +33,14 @@ class ResolvedInstruments:
 
 
 def resolve_instruments(config: InstrumentConfig, as_of: datetime | None = None) -> ResolvedInstruments:
-    """Resolve separate data and execution instruments.
+    """Resolve Databento data instrument from the current ES front month.
 
-    Databento can safely use a continuous symbol for signal generation, while
-    IBKR execution should use a concrete futures contract. The execution
-    contract can be forced with `IBKR_ES_INSTRUMENT_ID`, for example ESU6.CME.
+    NinjaTrader remains the execution owner. The execution-like symbol here is
+    only used to derive the matching concrete Databento futures contract.
+    It can be forced with `ES_EXECUTION_INSTRUMENT_ID`, for example ESU6.CME.
     """
 
-    exec_override = os.getenv(config.ibkr_instrument_env, "").strip()
+    exec_override = os.getenv(config.execution_instrument_env, "").strip()
     expiry_date = None
     rollover_date = None
     if exec_override:
@@ -48,9 +48,9 @@ def resolve_instruments(config: InstrumentConfig, as_of: datetime | None = None)
         exec_source = "env"
     else:
         front = _front_es_instrument(
-            symbol=config.ibkr_symbol,
-            exchange=config.ibkr_exchange,
-            rollover_days_before_expiry=config.ibkr_rollover_days_before_expiry,
+            symbol=config.execution_symbol,
+            exchange=config.execution_venue,
+            rollover_days_before_expiry=config.rollover_days_before_expiry,
             as_of=(as_of or datetime.now()).date(),
         )
         exec_symbol = front.instrument_id
