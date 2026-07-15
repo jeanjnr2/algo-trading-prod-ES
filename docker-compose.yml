@@ -1,0 +1,25 @@
+services:
+  strategy-prod-v8-es:
+    build: .
+    image: strategy-prod-v8-es:local
+    container_name: strategy-prod-v8-es
+    restart: unless-stopped
+    environment:
+      DATABENTO_API_KEY: "${DATABENTO_API_KEY}"
+      ALGO_TRADING_MODE: "${ALGO_TRADING_MODE:-paper}"
+      TWS_ACCOUNT: "${TWS_ACCOUNT:-}"
+      TWS_ACCOUNT_PAPER: "${TWS_ACCOUNT_PAPER:-}"
+      TWS_ACCOUNT_LIVE: "${TWS_ACCOUNT_LIVE:-}"
+      IBKR_ES_INSTRUMENT_ID: "${IBKR_ES_INSTRUMENT_ID:-}"
+      IBKR_HOST: "${IBKR_HOST:-host.docker.internal}"
+      IBKR_AUTO_START_GATEWAY: "${IBKR_AUTO_START_GATEWAY:-true}"
+      IBKR_CLIENT_ID: "${IBKR_CLIENT_ID:-}"
+      ALGO_INSTANCE_ID: "${ALGO_INSTANCE_ID:-V8_ES}"
+      TWS_USERNAME: "${TWS_USERNAME:-}"
+      TWS_PASSWORD: "${TWS_PASSWORD:-}"
+    volumes:
+      - ./control:/app/control
+      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -1,0 +1,36 @@
+# Secrets and local launch state
+.env
+.env.*
+
+# Runtime control files
+control/ibkr_client_ids.json
+control/ibkr_client_ids.json.lock
+
+# Logs
+logs/
+*.log
+
+# Python cache and local tooling
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Data, exports, and bulky generated outputs
+*.csv
+*.parquet
+*_outputs/
+backtest_outputs/
+
+# Archives / Docker image exports
+*.tar
+*.zip
+*.7z
