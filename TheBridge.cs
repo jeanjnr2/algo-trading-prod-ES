@@ -7,8 +7,11 @@
 
 #region Using declarations
 using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
+using System.Linq;
 using System.Threading;
 using NetMQ;
 using NetMQ.Sockets;
@@ -19,6 +22,7 @@ using NinjaTrader.NinjaScript;
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    [TypeConverter(typeof(TheBridgePropertyConverter))]
     public class TheBridge : Strategy
     {
         private const double EsMarginPerContract = 500.0;
@@ -622,6 +626,43 @@ namespace NinjaTrader.NinjaScript.Strategies
         private static string EscapeJson(string value)
         {
             return (value ?? string.Empty).Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+    }
+
+    public class TheBridgePropertyConverter : TypeConverter
+    {
+        private static readonly HashSet<string> HiddenProperties = new HashSet<string>
+        {
+            "OrderFillResolution",
+            "OrderFillResolutionType",
+            "FillLimitOrdersOnTouch",
+            "Slippage",
+            "EntriesPerDirection",
+            "EntryHandling",
+            "IsExitOnSessionCloseStrategy",
+            "ExitOnSessionCloseSeconds",
+            "StopTargetHandling",
+            "SetOrderQuantity",
+            "TimeInForce"
+        };
+
+        public override bool GetPropertiesSupported(ITypeDescriptorContext context)
+        {
+            return true;
+        }
+
+        public override PropertyDescriptorCollection GetProperties(
+            ITypeDescriptorContext context,
+            object value,
+            Attribute[] attributes)
+        {
+            PropertyDescriptorCollection properties = TypeDescriptor.GetProperties(value, attributes, true);
+            PropertyDescriptor[] visibleProperties = properties
+                .Cast<PropertyDescriptor>()
+                .Where(property => !HiddenProperties.Contains(property.Name))
+                .ToArray();
+
+            return new PropertyDescriptorCollection(visibleProperties);
         }
     }
 }
